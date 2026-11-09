@@ -10,7 +10,10 @@
 // Un PDF se dibuja con pdf.js (la página 1 en un canvas), nunca con el visor de Chrome. Un HTML es la copia limpia que
 // guarda el servicio: se abre sin JavaScript y sin red, solo con lo propio, en una hoja con la proporción de un A4 y el
 // ancho de una pantalla. Antes se le dibujan las fórmulas como MathML, igual que en el lector del banco. Un HTML con
-// sus scripts aprobados también va sin JavaScript: la foto es la de su copia limpia.
+// sus scripts prendidos por el panel (`js` en lo pendiente) se arma con ellos, desde su original, porque sin ellos la
+// página queda vacía. Corren igual sin red, sin ventanas ni descargas. Si el servicio no da el original, va la copia
+// limpia. La foto empieza en lo primero que se ve: un menú escondido arriba no deja la hoja vacía. Una hoja en blanco
+// no se sube y la tarjeta sigue con su carátula.
 // Lo que viene del banco es hostil. Cada archivo va en contextos nuevos que se cierran al terminar o al pasarse del
 // tiempo. El navegador no hereda los secretos ni tiene red: Playwright sirve lo del taller y corta el resto, y lo que
 // se escape va a un proxy que no existe. Nada de lo que trae un archivo se imprime: los logs llevan solo ids y conteos.
@@ -39,6 +42,8 @@ const TOPE_ARCHIVO = 16 * 1024 * 1024; // PDF hasta 15 MB y HTML hasta 5 MB, má
 const TIEMPO_POR_PEDIDO_MS = 60_000;
 const TIEMPO_POR_ARCHIVO_MS = 45_000;
 const TIEMPO_TOTAL_MS = 12 * 60_000; // Menos que `timeout-minutes` del workflow.
+// Lo que esperan los scripts de un HTML para armar su página antes de la foto.
+const ESPERA_SCRIPTS_MS = 2500;
 const TOPE_POR_CORRIDA = 200;
 const TALLER = 'https://taller.invalid';
 
@@ -100,11 +105,19 @@ async function pendientes(cfg) {
   );
 }
 
+// { bytes, js }: el archivo, y si es el original de un HTML con sus scripts. null si ya no espera su foto.
 async function bajar(cfg, p) {
+  if (p.tipo === 'html' && p.js === true) {
+    const res = await pedir(cfg, `a=fotos-archivo&id=${p.id}&version=${p.version}&js=1`);
+    if (res.status === 409) return null;
+    if (res.ok) return { bytes: await leerConTope(res, TOPE_ARCHIVO), js: true };
+    // Sin el original (404 sin-js), la copia limpia.
+    if (res.status !== 404) throw new Error(`fotos-archivo respondió ${res.status}`);
+  }
   const res = await pedir(cfg, `a=fotos-archivo&id=${p.id}&version=${p.version}`);
   if (res.status === 404 || res.status === 409) return null;
   if (!res.ok) throw new Error(`fotos-archivo respondió ${res.status}`);
-  return leerConTope(res, TOPE_ARCHIVO);
+  return { bytes: await leerConTope(res, TOPE_ARCHIVO), js: false };
 }
 
 async function subir(cfg, p, foto) {
@@ -176,21 +189,54 @@ async function fotoDePdf(abrir, bytes) {
   return taller.evaluate((o) => window.fotoDePdf(o), OPCIONES_FOTO);
 }
 
-async function fotoDeHtml(abrir, bytes) {
+// Dónde empieza lo que se ve: el borde de arriba del primer texto o imagen visible dentro del ancho de la hoja. Un menú
+// lateral que en una pantalla chica se esconde corrido a un costado deja su lugar arriba, vacío.
+function dondeEmpieza() {
+  const ancho = window.innerWidth;
+  let arriba = Infinity;
+  const anotar = (r) => {
+    if (r.width >= 1 && r.height >= 1 && r.right > 0 && r.left < ancho) arriba = Math.min(arriba, r.top + window.scrollY);
+  };
+  const visible = (el) => el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+  const textos = document.createTreeWalker(document.body ?? document.documentElement, NodeFilter.SHOW_TEXT);
+  const rango = document.createRange();
+  for (let n = textos.nextNode(); n; n = textos.nextNode()) {
+    if (!n.textContent.trim() || !n.parentElement || !visible(n.parentElement)) continue;
+    rango.selectNodeContents(n);
+    for (const r of rango.getClientRects()) anotar(r);
+  }
+  for (const el of document.querySelectorAll('img, svg, canvas, video, math')) {
+    const r = el.getBoundingClientRect();
+    if (r.width >= 16 && r.height >= 16 && visible(el)) anotar(r);
+  }
+  return { arriba: Number.isFinite(arriba) ? arriba : 0, alto: document.documentElement.scrollHeight };
+}
+
+async function fotoDeHtml(abrir, { bytes, js }) {
   const taller = await abrirTaller(abrir);
-  const html = await taller.evaluate((t) => window.prepararHtml(t), bytes.toString('utf8'));
-  // La hoja: sin JavaScript, sin red, sin descargas ni ventanas nuevas.
+  const html = await taller.evaluate(([t, s]) => window.prepararHtml(t, { conScripts: s }), [bytes.toString('utf8'), js]);
+  // La hoja: sin red, sin descargas ni ventanas nuevas. JavaScript solo para los scripts que prendió el panel.
   const contexto = await abrir({
     viewport: HOJA_HTML,
     deviceScaleFactor: 1,
-    javaScriptEnabled: false,
+    javaScriptEnabled: js,
     serviceWorkers: 'block',
     acceptDownloads: false,
   });
   await contexto.route('**/*', (route) => route.abort('blockedbyclient'));
   const pagina = await contexto.newPage();
+  pagina.on('popup', (otra) => otra.close().catch(() => {}));
   await pagina.setContent(html, { waitUntil: 'load', timeout: TIEMPO_POR_ARCHIVO_MS });
-  const png = await pagina.screenshot({ type: 'png', animations: 'disabled', timeout: TIEMPO_POR_ARCHIVO_MS });
+  if (js) await pagina.waitForTimeout(ESPERA_SCRIPTS_MS);
+  const { arriba, alto } = await pagina.evaluate(dondeEmpieza);
+  // Lo primero que se ve, con un respiro arriba. Cerca del principio, desde el principio.
+  const desde = arriba > 48 ? Math.max(0, Math.min(arriba - 24, alto - HOJA_HTML.height)) : 0;
+  const png = await pagina.screenshot({
+    type: 'png',
+    animations: 'disabled',
+    timeout: TIEMPO_POR_ARCHIVO_MS,
+    ...(desde ? { fullPage: true, clip: { x: 0, y: desde, width: HOJA_HTML.width, height: HOJA_HTML.height } } : {}),
+  });
   return taller.evaluate(([d, o]) => window.fotoDePng(d, o), [png.toString('base64'), OPCIONES_FOTO]);
 }
 
@@ -218,7 +264,7 @@ async function sacarFoto(navegador, p, bytes) {
     return contexto;
   };
   try {
-    const hecha = await conTiempo(p.tipo === 'pdf' ? fotoDePdf(abrir, bytes) : fotoDeHtml(abrir, bytes), TIEMPO_POR_ARCHIVO_MS);
+    const hecha = await conTiempo(p.tipo === 'pdf' ? fotoDePdf(abrir, bytes.bytes) : fotoDeHtml(abrir, bytes), TIEMPO_POR_ARCHIVO_MS);
     if (typeof hecha?.datos !== 'string' || hecha.tipo !== 'image/webp') throw new Error('el taller no devolvió una foto');
     return { bytes: Buffer.from(hecha.datos, 'base64'), tipo: hecha.tipo, ancho: hecha.ancho, alto: hecha.alto };
   } finally {
