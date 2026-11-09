@@ -36,6 +36,18 @@ function enBlanco(c, ancho, alto) {
   return conTinta / alto < 0.08;
 }
 
+// El brillo medio de la hoja, de 0 a 255: con él se sabe si la página en modo oscuro cambió de tema.
+function brilloMedio(c, ancho, alto) {
+  const { data } = c.getImageData(0, 0, ancho, alto);
+  let suma = 0;
+  let puntos = 0;
+  for (let i = 0; i < data.length; i += 4 * 5) {
+    suma += 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+    puntos += 1;
+  }
+  return Math.round(suma / puntos);
+}
+
 // Lleva la imagen al ancho final sobre blanco, con el alto entre los topes (una página más larga se corta abajo, una
 // más ancha se completa con blanco), y la pasa a WebP con la mejor calidad que entre en el tope. Con `revisarBlanco`
 // (la hoja de un HTML), una hoja vacía no sale: la portada de un PDF puede tener poco y sigue siendo su foto.
@@ -51,10 +63,11 @@ async function armarFoto(origen, ancho, alto, { tope, calidades, proporcionMin, 
   c.imageSmoothingQuality = 'high';
   c.drawImage(origen, 0, 0, ancho, alto, 0, 0, final, altoFinal);
   if (revisarBlanco && enBlanco(c, lienzo.width, lienzo.height)) throw new Error('la hoja está en blanco');
+  const brillo = brilloMedio(c, lienzo.width, lienzo.height);
   for (const calidad of calidades) {
     const blob = await new Promise((listo) => lienzo.toBlob(listo, 'image/webp', calidad));
     if (blob && blob.type === 'image/webp' && blob.size <= tope) {
-      return { datos: await aBase64(blob), tipo: 'image/webp', ancho: lienzo.width, alto: lienzo.height };
+      return { datos: await aBase64(blob), tipo: 'image/webp', ancho: lienzo.width, alto: lienzo.height, brillo };
     }
   }
   throw new Error('la foto no entra en el tope');

@@ -13,7 +13,8 @@
 // sus scripts prendidos por el panel (`js` en lo pendiente) se arma con ellos, desde su original, porque sin ellos la
 // página queda vacía. Corren igual sin red, sin ventanas ni descargas. Si el servicio no da el original, va la copia
 // limpia. La foto empieza en lo primero que se ve: un menú escondido arriba no deja la hoja vacía. Una hoja en blanco
-// no se sube y la tarjeta sigue con su carátula.
+// no se sube y la tarjeta sigue con su carátula. Después de la clara, un HTML se abre otra vez con Chrome en modo oscuro:
+// si su página tiene tema oscuro (se ve bastante más oscura), esa foto se sube aparte, para las tarjetas en tema oscuro.
 // Lo que viene del banco es hostil. Cada archivo va en contextos nuevos que se cierran al terminar o al pasarse del
 // tiempo. El navegador no hereda los secretos ni tiene red: Playwright sirve lo del taller y corta el resto, y lo que
 // se escape va a un proxy que no existe. Nada de lo que trae un archivo se imprime: los logs llevan solo ids y conteos.
@@ -44,6 +45,8 @@ const TIEMPO_POR_ARCHIVO_MS = 45_000;
 const TIEMPO_TOTAL_MS = 12 * 60_000; // Menos que `timeout-minutes` del workflow.
 // Lo que esperan los scripts de un HTML para armar su página antes de la foto.
 const ESPERA_SCRIPTS_MS = 2500;
+// Cuánto más oscura (brillo medio, de 0 a 255) tiene que salir la foto en modo oscuro para ser la de su tema oscuro.
+const DIFERENCIA_OSCURA = 40;
 const TOPE_POR_CORRIDA = 200;
 const TALLER = 'https://taller.invalid';
 
@@ -120,8 +123,8 @@ async function bajar(cfg, p) {
   return { bytes: await leerConTope(res, TOPE_ARCHIVO), js: false };
 }
 
-async function subir(cfg, p, foto) {
-  const res = await pedir(cfg, `a=fotos-subir&id=${p.id}&version=${p.version}`, {
+async function subir(cfg, p, foto, tema = null) {
+  const res = await pedir(cfg, `a=fotos-subir&id=${p.id}&version=${p.version}${tema ? `&tema=${tema}` : ''}`, {
     method: 'POST',
     headers: { 'content-type': foto.tipo },
     body: foto.bytes,
@@ -212,7 +215,7 @@ function dondeEmpieza() {
   return { arriba: Number.isFinite(arriba) ? arriba : 0, alto: document.documentElement.scrollHeight };
 }
 
-async function fotoDeHtml(abrir, { bytes, js }) {
+async function fotoDeHtml(abrir, { bytes, js }, esquema = 'light') {
   const taller = await abrirTaller(abrir);
   const html = await taller.evaluate(([t, s]) => window.prepararHtml(t, { conScripts: s }), [bytes.toString('utf8'), js]);
   // La hoja: sin red, sin descargas ni ventanas nuevas. JavaScript solo para los scripts que prendió el panel.
@@ -220,6 +223,7 @@ async function fotoDeHtml(abrir, { bytes, js }) {
     viewport: HOJA_HTML,
     deviceScaleFactor: 1,
     javaScriptEnabled: js,
+    colorScheme: esquema,
     serviceWorkers: 'block',
     acceptDownloads: false,
   });
@@ -250,7 +254,7 @@ function conTiempo(promesa, ms) {
   ]).finally(() => clearTimeout(reloj));
 }
 
-async function sacarFoto(navegador, p, bytes) {
+async function sacarFoto(navegador, p, bytes, esquema = 'light') {
   const abiertos = [];
   let terminado = false;
   const abrir = async (opciones) => {
@@ -264,9 +268,9 @@ async function sacarFoto(navegador, p, bytes) {
     return contexto;
   };
   try {
-    const hecha = await conTiempo(p.tipo === 'pdf' ? fotoDePdf(abrir, bytes.bytes) : fotoDeHtml(abrir, bytes), TIEMPO_POR_ARCHIVO_MS);
+    const hecha = await conTiempo(p.tipo === 'pdf' ? fotoDePdf(abrir, bytes.bytes) : fotoDeHtml(abrir, bytes, esquema), TIEMPO_POR_ARCHIVO_MS);
     if (typeof hecha?.datos !== 'string' || hecha.tipo !== 'image/webp') throw new Error('el taller no devolvió una foto');
-    return { bytes: Buffer.from(hecha.datos, 'base64'), tipo: hecha.tipo, ancho: hecha.ancho, alto: hecha.alto };
+    return { bytes: Buffer.from(hecha.datos, 'base64'), tipo: hecha.tipo, ancho: hecha.ancho, alto: hecha.alto, brillo: Number(hecha.brillo) };
   } finally {
     terminado = true;
     await Promise.all(abiertos.map((c) => c.close().catch(() => {})));
@@ -309,6 +313,19 @@ async function abrirNavegador() {
   }
 }
 
+// La foto del tema oscuro de un HTML, si su página lo tiene. Si falla, queda la clara: no cuenta como fallida.
+async function subirOscura(cfg, navegador, p, bytes, clara) {
+  try {
+    const oscura = await sacarFoto(navegador, p, bytes, 'dark');
+    if (!(oscura.brillo < clara.brillo - DIFERENCIA_OSCURA)) return;
+    const resultado = await subir(cfg, p, oscura, 'oscuro');
+    if (resultado === 'subida') console.log(`${p.id} v${p.version} html: también en tema oscuro, ${Math.round(oscura.bytes.length / 1024)} KiB.`);
+  } catch (e) {
+    const motivo = e instanceof Error ? e.message.split('\n')[0].slice(0, 80) : 'error';
+    console.log(`::warning::${p.id} v${p.version} html: no salió la foto oscura (${motivo.replace(/[^\p{L}\p{N} ()._:-]/gu, '')}).`);
+  }
+}
+
 // ---------- Principal ----------
 
 async function principal() {
@@ -335,6 +352,7 @@ async function principal() {
           const resultado = await subir(cfg, p, foto);
           cuenta[resultado]++;
           console.log(`${p.id} v${p.version} ${p.tipo}: ${resultado === 'subida' ? `${foto.ancho}x${foto.alto}, ${Math.round(foto.bytes.length / 1024)} KiB` : 'ya no hacía falta'}.`);
+          if (p.tipo === 'html' && resultado === 'subida') await subirOscura(cfg, navegador, p, bytes, foto);
         } catch (e) {
           cuenta.fallida++;
           // Solo el id y un motivo nuestro: nada del archivo.
