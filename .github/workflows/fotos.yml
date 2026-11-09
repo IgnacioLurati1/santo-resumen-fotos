@@ -1,0 +1,37 @@
+# Fotos de la primera página de los resúmenes del banco de El Santo Resumen (sacar-fotos.mjs). Le pide al servicio lo
+# que espera su foto, la saca con el Chrome que ya trae ubuntu-latest y la sube. No baja ningún navegador.
+# Corre solo cuando la pide el servicio por la API de GitHub, después de una subida, una versión nueva o una aprobación
+# (workflow_dispatch), o a mano desde Actions. Sin cron. Sin nada pendiente termina enseguida.
+# Secretos del repo: UTN_API_URL (base de la función utn) y UTN_FOTOS_SECRETO. Nunca en el código.
+# Si GitHub llegara a apagarlo, el servicio lo vuelve a prender en el próximo aviso: su token tiene «Actions: Read and
+# write» sobre este repo.
+name: Fotos del banco
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+# Una corrida a la vez y sin cortar la que está andando: la que sigue toma lo que quede pendiente.
+concurrency:
+  group: fotos
+  cancel-in-progress: false
+jobs:
+  fotos:
+    runs-on: ubuntu-latest
+    # Más que el tope de 12 minutos del script.
+    timeout-minutes: 15
+    steps:
+      # Las acciones van fijadas por commit (con la versión al lado): una etiqueta se puede mover.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      # Sin scripts de instalación y sin lo opcional: pdf.js corre dentro de Chrome y no necesita su canvas nativo.
+      - run: npm ci --ignore-scripts --omit=optional --no-audit --no-fund
+      - run: node sacar-fotos.mjs
+        env:
+          UTN_API_URL: ${{ secrets.UTN_API_URL }}
+          UTN_FOTOS_SECRETO: ${{ secrets.UTN_FOTOS_SECRETO }}
+          CHROME: /usr/bin/google-chrome
